@@ -120,6 +120,11 @@ textarea { resize: vertical; }
   background: transparent; border: 1px solid var(--border); border-radius: 8px;
   padding: 8px 10px; font-size: 16px; cursor: pointer; color: var(--text);
 }
+.icon-btn.spinning { animation: icon-spin 0.7s linear infinite; }
+@keyframes icon-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 /* Tab bar: top row on desktop, bottom bar on mobile (see media query) */
 .tabbar {

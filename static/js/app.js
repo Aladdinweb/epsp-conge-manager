@@ -1,6 +1,25 @@
 // TASHIL DOCUMENT HUB — Web Edition — app.js
 // Vanilla JS, no build step required (runs identically via Termux + browser).
 
+// Safe replacement for `await res.json()` used throughout this file. The
+// backend now always returns JSON on /api/ routes (see app.py's global
+// error handlers), but this is a defense-in-depth backstop against any
+// non-JSON response reaching the frontend (e.g. from something outside
+// Flask entirely, like a captive-portal page on a public Wi-Fi). Without
+// this, a non-JSON body throws a cryptic "Unexpected token '<'..." error
+// instead of a readable message.
+async function parseJsonResponse(res) {
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await res.text();
+    throw new Error(
+      `Réponse inattendue du serveur (HTTP ${res.status})` +
+      (text ? ` : ${text.slice(0, 150)}` : "")
+    );
+  }
+  return res.json();
+}
+
 const state = {
   profile: null,
   meta: null,
@@ -332,6 +351,7 @@ function showApp() {
     setupLogout();
     setupDeleteProfile();
     setupLockButton();
+    setupRefreshButton();
     setupCopyLanUrl();
     setupCloudBridge();
     startBackgroundPolling();
@@ -357,6 +377,39 @@ function showApp() {
 
 function setupLockButton() {
   document.getElementById("lock-btn").onclick = lockSession;
+}
+
+function setupRefreshButton() {
+  document.getElementById("refresh-btn").onclick = manualRefresh;
+}
+
+async function manualRefresh() {
+  const btn = document.getElementById("refresh-btn");
+  btn.classList.add("spinning");
+  try {
+    // Always poll the bridge (cheap no-op if not configured — pollBridge
+    // checks state.bridgeEnabled itself) so a manual refresh reliably
+    // surfaces anything new without waiting for the 45s background timer.
+    await pollBridge(false);
+
+    if (state.currentView === "dashboard") await loadDashboard();
+    else if (state.currentView === "messagerie") {
+      await loadInbox();
+      await loadDashboard(); // keeps stat cards current even off-screen
+    } else if (state.currentView === "registre") {
+      const activeFilter = document.querySelector(".subtab[data-filter].active");
+      await loadRegistre(activeFilter ? activeFilter.dataset.filter : "tous");
+    } else if (state.currentView === "etablissements") {
+      await loadEtablissements();
+    } else if (state.currentView === "parametres") {
+      await refreshBridgeUI();
+    }
+    showToast("🔄 Actualisé", "success");
+  } catch (err) {
+    showToast("⛔ Échec de l'actualisation", "error");
+  } finally {
+    btn.classList.remove("spinning");
+  }
 }
 
 function setupCopyLanUrl() {
@@ -509,6 +562,53 @@ function switchView(viewName) {
   if (viewName === "dashboard") loadDashboard();
   if (viewName === "messagerie") loadInbox();
   if (viewName === "registre") loadRegistre("tous");
+  if (viewName === "etablissements") loadEtablissements();
+}
+
+async function loadEtablissements() {
+  const container = document.getElementById("etablissements-list");
+  const offCard = document.getElementById("etablissements-bridge-off");
+
+  try {
+    const data = await fetch("/api/bridge/directory").then(r => parseJsonResponse(r));
+    if (!data.bridge_enabled) {
+      offCard.classList.remove("hidden");
+      container.innerHTML = "";
+      return;
+    }
+    offCard.classList.add("hidden");
+
+    if (!data.institutions.length) {
+      container.innerHTML = `<p class="empty-state">Aucun établissement détecté pour le moment. ` +
+        `Ils apparaîtront ici après leur première synchronisation avec le Réseau TASHIL.</p>`;
+      return;
+    }
+
+    container.innerHTML = data.institutions.map(inst => `
+      <div class="list-row">
+        <div class="list-row-main">
+          <span class="list-row-title">
+            <span class="bridge-dot ${inst.online ? "bridge-dot-on" : "bridge-dot-off"}"></span>
+            ${escapeHtml(inst.institution_name)}
+          </span>
+          <span class="list-row-sub">${escapeHtml(inst.wilaya_name)} — ${escapeHtml(inst.institution_type)}</span>
+        </div>
+        <span class="list-row-badge">${inst.online ? "En ligne" : "Vu " + timeAgo(inst.last_seen)}</span>
+      </div>
+    `).join("");
+  } catch (err) {
+    container.innerHTML = `<p class="empty-state">⛔ Impossible de charger la liste des établissements.</p>`;
+  }
+}
+
+function timeAgo(isoString) {
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "à l'instant";
+  if (mins < 60) return `il y a ${mins} min`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `il y a ${hours} h`;
+  return `il y a ${Math.floor(hours / 24)} j`;
 }
 
 function setupThemeToggle() {
@@ -678,7 +778,7 @@ function setupMessaging() {
 
     try {
       const res = await fetch("/api/messages/send", { method: "POST", body: formData });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (!res.ok) throw new Error(data.error || "Échec de l'envoi.");
 
       if (data.delivered_locally) {
@@ -686,11 +786,26 @@ function setupMessaging() {
         statusEl.classList.add("ok");
         showToast(`📤 Document remis à ${recipient}`, "success");
         showSystemNotification("TASHIL DOCUMENT HUB", `Document remis à ${recipient}`);
+      } else if (data.delivered_via_bridge) {
+        // This branch was previously missing entirely — a successful
+        // Cloud Bridge delivery was incorrectly reported as "archived,
+        // not transmitted" because only delivered_locally was checked.
+        statusEl.textContent = `☁️ Document transmis via le Réseau TASHIL — ${data.tracking_number}. ` +
+          `En attente de consultation par ${recipient}.`;
+        statusEl.classList.add("ok");
+        showToast(`☁️ Document transmis via le Cloud Bridge à ${recipient}`, "success");
+        showSystemNotification("TASHIL DOCUMENT HUB", `Document transmis à ${recipient} via le Réseau TASHIL`);
+      } else if (data.bridge_attempted) {
+        statusEl.textContent = `⚠️ Document archivé — ${data.tracking_number}. ` +
+          `La transmission via le Réseau TASHIL a échoué (vérifiez la connexion réseau ` +
+          `dans Paramètres). Le document reste enregistré ici.`;
+        statusEl.classList.add("err");
+        showToast(`⚠️ Archivé — échec de la transmission distante`, "error");
       } else {
         statusEl.textContent = `📦 Document archivé — ${data.tracking_number}. ` +
-          `Aucun profil "${recipient}" trouvé sur cet appareil : le document est enregistré ` +
-          `ici mais n'a pas pu être transmis. La transmission vers un autre ordinateur / ` +
-          `réseau n'est pas encore disponible (voir Paramètres).`;
+          `Aucun profil "${recipient}" trouvé sur cet appareil, et le Réseau TASHIL n'est ` +
+          `pas configuré ici : le document est enregistré mais n'a pas pu être transmis ` +
+          `(voir Paramètres → Réseau TASHIL).`;
         statusEl.classList.add("err");
         showToast(`📦 Archivé — non transmis (${recipient} n'a pas de profil ici)`, "info");
       }

@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.7.1
+## Documentation de traçabilité — v2.8.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-09-02
+**Date :** 2026-09-07
 
 ---
 
@@ -1045,3 +1045,109 @@ du message d'erreur d'import réel), `requirements.txt`
 (`opencv-python-headless` → `pyzbar`), `tashil_web.spec` (collection
 PyInstaller mise à jour en conséquence). Aucune fonctionnalité antérieure
 retirée.
+
+---
+
+## 17. v2.8.0 — Gestion d'erreurs JSON, Établissements Connectés, actualisation manuelle, cycle de vie "En attente" (2026-09-07)
+
+### 17.1 🐛 Correctif critique : erreur JSON à l'envoi (PC bureau)
+
+**Cause confirmée** : aucune gestion d'erreur globale n'existait sur les
+routes `/api/` — toute exception non interceptée, ou tout dépassement de
+la limite de taille de fichier (413), tombait dans la page d'erreur HTML
+par défaut de Flask/Werkzeug. Le frontend appelait `res.json()` dessus,
+provoquant exactement l'erreur rapportée : `Unexpected token '<',
+"<!doctype "... is not valid JSON`.
+
+**Correctif** : trois gestionnaires d'erreur globaux (`413`, `404`,
+`Exception`) enregistrés au niveau de l'application — toute route `/api/`
+renvoie désormais systématiquement du JSON, quoi qu'il arrive à
+l'intérieur. La vraie exception est toujours journalisée côté serveur
+pour diagnostic, jamais exposée telle quelle au frontend. Remplace
+avantageusement l'idée initiale d'un `try/except` local à la seule route
+d'envoi : la couverture est désormais totale, présente et future, sur
+toutes les routes.
+
+**Testé réellement** :
+- ✅ Upload de fichier > 64 Mo → `HTTP 413`, JSON propre (au lieu de HTML)
+- ✅ Route inexistante → `HTTP 404`, JSON propre
+- ✅ Exception Python délibérément déclenchée dans une route de test →
+  `HTTP 500`, JSON propre contenant le message d'erreur réel
+
+**Bug réel supplémentaire trouvé et corrigé dans la foulée** : le
+frontend ne vérifiait que `data.delivered_locally` après un envoi — si
+`false`, il affichait systématiquement "archivé, non transmis", **même
+si la transmission via le Cloud Bridge avait réellement réussi**
+(`data.delivered_via_bridge` n'était jamais consulté). C'est très
+probablement la cause de la confusion précédente de l'utilisateur face à
+ce message. Corrigé : la logique distingue maintenant explicitement trois
+cas — livré localement / livré via le Réseau TASHIL / réellement non
+transmis — avec un message juste dans chaque cas.
+
+Ajout d'un utilitaire `parseJsonResponse()` côté frontend (défense en
+profondeur pour toute réponse non-JSON inattendue) — appliqué au flux
+d'envoi, le plus critique ; les autres appels `fetch` du fichier
+continuent d'utiliser `res.json()` directement, la couverture provenant
+désormais principalement du correctif backend qui s'applique déjà à
+toutes les routes.
+
+### 17.2 Section "Établissements Connectés"
+
+**⚠️ Contrainte de conception réelle, à comprendre** : le dépôt du Cloud
+Bridge ne contenait jusqu'ici aucun registre des établissements — un
+dossier `bridge/<adresse>/` n'apparaît que lorsqu'un envoi y a
+effectivement été poussé. Impossible de répondre à "quels établissements
+sont configurés/actifs" avec la seule structure existante. Un mécanisme
+de présence explicite a été ajouté :
+- Chaque appareil déverrouillé écrit périodiquement son propre fichier de
+  présence dans `directory/<institution_key>.json`, greffé sur le cycle
+  de sondage existant (aucune minuterie supplémentaire, donc aucun coût
+  API GitHub additionnel au-delà du sondage déjà en place).
+- Nouvelle route `GET /api/bridge/directory` : liste `directory/`, calcule
+  "en ligne" si la dernière annonce date de moins de 3 minutes environ
+  (~4 cycles de sondage de 45s manqués).
+- **"Connecté" signifie concrètement "a annoncé sa présence récemment"** —
+  un appareil resté fermé un moment repassera correctement "hors ligne"
+  simplement parce qu'il a cessé de s'annoncer, pas parce qu'une panne a
+  été détectée.
+- Nouvel onglet "🏥 Établissements" dans la barre latérale, avec indicateur
+  visuel (point vert/gris, réutilise le style déjà existant du badge Cloud
+  Bridge) et horodatage relatif ("vu il y a X min").
+
+**Testé réellement** : heartbeat émis lors d'un sondage → apparaît dans
+l'annuaire comme "en ligne" ; second établissement simulé rejoint → les
+deux apparaissent ; horodatage manuellement antidaté → passe
+correctement à "hors ligne" au sondage suivant.
+
+### 17.3 Bouton d'actualisation manuelle
+
+Nouveau bouton "🔄" dans la barre supérieure — sonde le Cloud Bridge (sans
+effet si non configuré) puis rafraîchit les données propres à la vue
+actuellement affichée (Tableau de Bord, Boîte de réception + statistiques,
+Registre avec son filtre actif, ou statut du Réseau TASHIL en
+Paramètres), sans jamais nécessiter de redémarrage de l'application.
+Animation de rotation pendant le chargement.
+
+### 17.4 Cycle de vie du statut "En attente"
+
+**Bug de fond trouvé** : le compteur "En Attente" du Tableau de Bord
+comptait `status = 'en_attente'` — une valeur que rien, nulle part dans
+le code, n'insérait jamais réellement (tout message sortant est créé
+avec `status = 'envoye'`). Ce compteur affichait donc silencieusement
+zéro depuis toujours.
+
+**Redéfinition, testée et confirmée fonctionnelle** : "En Attente" compte
+désormais les messages sortants dont le statut n'est PAS encore
+`'accuse'` — c'est-à-dire "envoyés mais pas encore consultés/accusés par
+le destinataire". `Total Envoyés` reste un compteur honnête et cumulatif
+de tous les envois, indépendamment de leur état d'accusé (choix
+délibéré : un "Total Envoyés" qui diminuerait ou ne compterait que les
+messages accusés serait un intitulé trompeur).
+
+**Testé réellement, cycle complet** : envoi → `pending: 1` → destinataire
+accuse réception → `pending: 0`, `total_sent` toujours à `1`.
+
+**Fichiers modifiés :** `app.py` (gestionnaires d'erreur globaux, requête
+`pending` corrigée, mécanisme de heartbeat/annuaire), `templates/index.html`,
+`static/css/style.css`, `static/js/app.js`. Aucune fonctionnalité
+antérieure retirée.

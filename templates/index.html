@@ -82,6 +82,7 @@
         <span class="brand-subtitle" id="institution-name">—</span>
       </div>
     </div>
+    <button id="refresh-btn" class="icon-btn" title="Actualiser">🔄</button>
     <button id="theme-toggle" class="icon-btn" title="Changer le thème">🌓</button>
     <button id="lock-btn" class="icon-btn" title="Verrouiller">🔒</button>
   </header>
@@ -95,6 +96,9 @@
     </button>
     <button class="tab" data-view="registre">
       <span class="tab-icon">🗂️</span><span class="tab-label">Registre</span>
+    </button>
+    <button class="tab" data-view="etablissements">
+      <span class="tab-icon">🏥</span><span class="tab-label">Établissements</span>
     </button>
     <button class="tab" data-view="parametres">
       <span class="tab-icon">⚙️</span><span class="tab-label">Paramètres</span>
@@ -194,6 +198,25 @@
       </div>
       <div class="card list-card" id="registre-list">
         <p class="empty-state">Aucun enregistrement.</p>
+      </div>
+    </section>
+
+    <!-- Établissements connectés -->
+    <section id="view-etablissements" class="view">
+      <h2>Établissements Connectés</h2>
+      <p class="muted">
+        Établissements ayant récemment communiqué via le Réseau TASHIL
+        (Cloud Bridge). "En ligne" signifie une présence annoncée au cours
+        des 3 dernières minutes environ.
+      </p>
+      <div id="etablissements-bridge-off" class="card hidden">
+        <p class="empty-state">
+          Le Réseau TASHIL n'est pas configuré sur cet appareil — voir
+          Paramètres pour l'activer.
+        </p>
+      </div>
+      <div class="card list-card" id="etablissements-list">
+        <p class="empty-state">Chargement...</p>
       </div>
     </section>
 

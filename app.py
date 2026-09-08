@@ -99,13 +99,47 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
             template_folder=os.path.join(APP_ROOT, "templates"),
             static_folder=os.path.join(APP_ROOT, "static"))
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64MB upload cap
+
+
+# --------------------------------------------------------------------------- #
+# Global JSON error handling. Without this, any unhandled exception or
+# oversized upload on an /api/ route falls through to Flask/Werkzeug's
+# default HTML error page — which is exactly what broke sending from the
+# desktop PC: the frontend calls res.json() on that HTML page and gets
+# "Unexpected token '<', <!doctype ..." instead of a real error message.
+# Every /api/ route now always returns JSON, no matter what fails inside
+# it; non-API routes (the page itself, static files) are unaffected.
+# --------------------------------------------------------------------------- #
+@app.errorhandler(413)
+def handle_payload_too_large(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Fichier trop volumineux (limite : 64 Mo)."}), 413
+    return e
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Route introuvable."}), 404
+    return e
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    if request.path.startswith("/api/"):
+        # Log the real exception server-side for diagnosis, but never leak
+        # a raw traceback to the frontend — just a clear, safe JSON error.
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erreur interne du serveur : {e}"}), 500
+    raise e
 
 INSTITUTION_TYPES = ["EPSP", "EPH", "CHU", "EHU", "Polyclinique"]
 _TYPE_CODES = {"EPSP": "EP", "EPH": "EH", "CHU": "CU", "EHU": "HU", "Polyclinique": "PC"}
@@ -962,7 +996,16 @@ def api_dashboard():
     conn = get_profile_db(_active_key)
     sent = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='sortant'").fetchone()["c"]
     received = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='entrant'").fetchone()["c"]
-    pending = conn.execute("SELECT COUNT(*) c FROM messages WHERE status='en_attente'").fetchone()["c"]
+    # "En attente" = sent but not yet acknowledged by the recipient. Note:
+    # previously this counted status='en_attente', a value nothing ever
+    # actually inserted (every outgoing message is written with status
+    # 'envoye') — so this counter silently showed 0 always. Redefined here
+    # to mean what the dashboard label actually implies: outgoing messages
+    # still awaiting an accusé de réception. total_sent stays an honest
+    # all-time count regardless of acknowledgement state.
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM messages WHERE direction='sortant' AND status != 'accuse'"
+    ).fetchone()["c"]
     recent = conn.execute("SELECT * FROM messages ORDER BY created_at DESC LIMIT 15").fetchall()
     conn.close()
     return jsonify({
@@ -1552,6 +1595,90 @@ def _retry_pending_bridge_cleanup(conn, owner: str, repo: str, token: str):
     conn.commit()
 
 
+# --------------------------------------------------------------------------- #
+# "Établissements connectés" (v2.8.0) — presence directory.
+#
+# ⚠️ Real design constraint, worth understanding: the bridge repo has no
+# built-in registry of institutions — a folder under bridge/<address>/
+# only exists once someone has actually SENT a message there. There was
+# no way to answer "which institutions are configured/active on the
+# network" from the existing structure alone. This adds an explicit
+# heartbeat: each unlocked device periodically writes its own presence
+# file to directory/<institution_key>.json, piggybacked on the existing
+# bridge poll cycle (no extra timer). "Connecté" here means "has recently
+# written a heartbeat" — a device that's been closed for a while will
+# correctly show as offline once its last heartbeat goes stale, not
+# because anything failed, simply because it stopped announcing itself.
+# --------------------------------------------------------------------------- #
+_HEARTBEAT_STALE_AFTER_SECONDS = 180  # ~4 missed 45s poll cycles
+
+
+def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
+    payload = {
+        "institution_key": profile["institution_key"],
+        "institution_name": profile["institution_name"],
+        "institution_type": profile["institution_type"],
+        "wilaya_name": profile["wilaya_name"],
+        "last_seen": datetime.now().isoformat(),
+    }
+    payload_b64 = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("utf-8")
+    path = f"directory/{profile['institution_key']}.json"
+
+    # Need the current sha to update an existing file — GitHub's Contents
+    # API rejects an overwrite without it. A fresh heartbeat file has none.
+    status, existing = _github_request("GET", f"/repos/{owner}/{repo}/contents/{path}", token)
+    body = {"message": f"TASHIL heartbeat: {profile['institution_name']}", "content": payload_b64}
+    if status == 200 and "sha" in existing:
+        body["sha"] = existing["sha"]
+
+    _github_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", token, body)
+
+
+@app.route("/api/bridge/directory", methods=["GET"])
+def api_bridge_directory():
+    if _active_key is None:
+        return locked_response()
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        return jsonify({"bridge_enabled": False, "institutions": []})
+
+    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+    status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/directory", token)
+    if status == 404:
+        return jsonify({"bridge_enabled": True, "institutions": []})
+    if status != 200:
+        return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+
+    now = datetime.now()
+    institutions = []
+    for entry in listing:
+        if not entry["name"].endswith(".json"):
+            continue
+        file_status, content = _github_request("GET", entry["url"], token)
+        if file_status != 200 or "content" not in content:
+            continue
+        try:
+            record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
+            last_seen = datetime.fromisoformat(record["last_seen"])
+        except (ValueError, KeyError):
+            continue
+
+        age_seconds = (now - last_seen).total_seconds()
+        institutions.append({
+            "institution_key": record.get("institution_key", ""),
+            "institution_name": record.get("institution_name", "?"),
+            "institution_type": record.get("institution_type", ""),
+            "wilaya_name": record.get("wilaya_name", ""),
+            "last_seen": record["last_seen"],
+            "online": age_seconds <= _HEARTBEAT_STALE_AFTER_SECONDS,
+        })
+
+    institutions.sort(key=lambda i: (not i["online"], i["institution_name"]))
+    return jsonify({"bridge_enabled": True, "institutions": institutions})
+
+
 @app.route("/api/bridge/poll", methods=["POST"])
 def api_bridge_poll():
     """
@@ -1578,6 +1705,14 @@ def api_bridge_poll():
     # Retry any deletions that failed on a previous poll BEFORE processing
     # new entries (see queue_bridge_cleanup / feature note above).
     _retry_pending_bridge_cleanup(conn, owner, repo, token)
+
+    # Announce presence for "Établissements connectés" — piggybacked here
+    # rather than a separate timer, so it costs no extra GitHub API budget
+    # beyond what polling already uses.
+    try:
+        _send_heartbeat(owner, repo, token, profile)
+    except Exception:
+        pass  # a missed heartbeat just means this device looks offline a bit longer, not a real failure
 
     # A sender may have addressed this institution either by its plain name
     # or by its exact routing ID (institution_key) — check both folders so
